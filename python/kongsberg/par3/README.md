@@ -1,7 +1,7 @@
 # par3 module - NOAA
 par3 module (originally developed by Glen) used by NOAA for reading .all files
 
-Can be used in one of two major ways:
+Can be used in one of three major ways:
 
 ## 1. Mapping/Seeking records:
 
