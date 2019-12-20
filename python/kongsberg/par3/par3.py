@@ -67,11 +67,12 @@ except ModuleNotFoundError:
     batch_read_enabled = False
 
 recs_categories = {'65': ['data.Time', 'data.Roll', 'data.Pitch', 'data.Heave', 'data.Heading'],
-                   '73': ['time', 'settings'],
+                   '73': ['time', 'header.Serial#', 'header.Serial#2', 'settings'],
                    '78': ['time', 'header.SoundSpeed', 'header.Ntx', 'header.Nrx', 'header.Nvalid',
-                          'header.SampleRate', 'tx.TransmitSector#', 'tx.TiltAngle', 'tx.SignalLength',
-                          'tx.Delay', 'tx.Frequency', 'tx.WaveformID', 'rx.BeamPointingAngle',
+                          'header.SampleRate', 'header.Serial#', 'tx.TransmitSector#', 'tx.TiltAngle',
+                          'tx.SignalLength', 'tx.Delay', 'tx.Frequency', 'tx.WaveformID', 'rx.BeamPointingAngle',
                           'rx.TransmitSectorID', 'rx.DetectionInfo', 'rx.QualityFactor', 'rx.TravelTime'],
+                   '82': ['time', 'header.Mode', 'header.YawAndPitchStabilization'],
                    '85': ['time', 'data.Depth', 'data.SoundSpeed'],
                    '110': ['data.Time', 'source_data.Latitude', 'source_data.Longitude',
                            'source_data.AlongTrackVelocity', 'source_data.Altitude']}
@@ -279,7 +280,7 @@ class AllRead:
 
                 # ping time equals datagram time plus sector transmit delay
                 setattr(split_rec, 'time', split_rec.time + split_rec.tx['Delay'])
-                #
+
                 totalrecs.append(split_rec)
             return totalrecs
 
@@ -366,7 +367,7 @@ class AllRead:
         """
         progress = 0
         if not self.mapped:
-            self.map = mappack()
+            self.map = mappack(self.infilename)
             self.reset()
             if show_progress:
                 print('Mapping file;           ', end=' ')
@@ -2037,6 +2038,7 @@ class Data73(BaseData):
         self.settings = {}
         self.ky_data73_translator = {'WLZ': 'waterline_vertical_location', 'SMH': 'system_main_head_serial_number',
                                      'HUN': 'hull_unit', 'HUT': 'hull_unit_offset', 'TXS': 'tx_serial_number',
+                                     'T2S': 'tx_2_serial_number',
                                      'T2X': 'tx_no2_serial_number', 'R1S': 'rx_no1_serial_number',
                                      'R2S': 'rx_no2_serial_number', 'STC': 'system_transducer_configuration',
                                      'S0Z': 'transducer_0_vertical_location', 'S0X': 'transducer_0_along_location',
@@ -2052,6 +2054,7 @@ class Data73(BaseData):
                                      'S3Z': 'transducer_3_vertical_location', 'S3X': 'transducer_3_along_location',
                                      'S3Y': 'transducer_3_athwart_location', 'S3H': 'transducer_3_heading_angle',
                                      'S3R': 'transducer_3_roll_angle', 'S3P': 'transducer_3_pitch_angle',
+                                     'S0S': 'tx_2_array_size', 'S3S': 'rx_2_array_size',
                                      'S1S': 'tx_array_size', 'S2S': 'rx_array_size', 'GO1': 'sonar_head_1_gain_offset',
                                      'GO2': 'sonar_head_2_gain_offset', 'OBO': 'outer_beam_offset',
                                      'FGD': 'high_low_freq_gain_difference', 'TSV': 'transmitter_software_version',
@@ -2134,11 +2137,14 @@ class Data73(BaseData):
             data = entry.split('=')
             if len(data) == 2:
                 ky = data[0]
-                if ky in self.ky_data73_val_translator:
+                try:
                     val = self.ky_data73_val_translator[ky][data[1]]
-                else:
+                except KeyError:
                     val = data[1]
-                self.settings[self.ky_data73_translator[ky]] = val
+                try:
+                    self.settings[self.ky_data73_translator[ky]] = val
+                except KeyError:
+                    self.settings[ky] = val
         self.settings['sonar_model_number'] = self.return_model_num(str(modelnum))
 
     def return_model_num(self, modelnum):
@@ -3351,7 +3357,7 @@ class mappack:
     Container for the file packet map.
     """
 
-    def __init__(self):
+    def __init__(self, infilename=None):
         """Constructor creates a packmap dictionary"""
         self.packdir = {}
         self.sizedir = {}
@@ -3382,6 +3388,8 @@ class mappack:
             66: 'PU BIST Results',
             51: 'Extra Parameters'
         }
+        self.totalfilesize = os.stat(infilename).st_size if infilename else 0
+        self.infilename = infilename
 
     def add(self, type, location=0, time=0, size=0, pingcounter=None):
         """Adds the location (byte in file) to the tuple for the value type"""
@@ -3415,10 +3423,12 @@ class mappack:
         keys.sort()
         for key in keys:
             dtype = self.gettype(key[0])
-            percent = 10000 * self.sizedir[str(key[0])] / totalsize
-            print(dtype + ' ' + str(key[0]) + ' (' + hex(int(key[0])) + ') has ' + str(key[1]
-                                                                                       ) + ' packets and is ' + str(
-                0.01 * percent) + '% of file.')
+            percent = 100.0 * (self.sizedir[str(key[0])] / self.totalfilesize)
+            print(dtype + ' ' + str(key[0]) + ' (' + hex(int(key[0])) + ') has ' + str(
+                key[1]) + ' packets and is ' + '%0.2f' % percent + '% of file.')
+        print('Total size of all packets: %d' % totalsize)
+        print('Total file size %d' % self.totalfilesize)
+        print('Percentage of total packet size vs total file size: %0.4f%%' % ((totalsize / self.totalfilesize) * 100.0))
 
     def getnum(self, recordtype):
         """
@@ -3455,6 +3465,27 @@ class mappack:
         infile = open(infilename, 'rb')
         self.__dict__ = pickle.load(infile)
         infile.close()
+        self.totalfilesize = os.stat(infilename).st_size
+
+
+def _xarr_is_bit_set(da, bitpos):
+    """
+    Check if bit is set using the Xarray DataArray and bit position.  Returns True if set.
+    Parameters
+    ----------
+    num: integer value for flag to check
+    bitpos: integer offset representing bit posititon (3 to check 3rd bit)
+
+    Returns
+    -------
+    chk: True if bitpos bit is set in val
+
+    """
+    try:
+        # get integer value from bitpos and return True if set in num
+        return da & (1 << (bitpos - 1))
+    except TypeError:
+        return da
 
 
 def _run_sequential_read(fildata):
@@ -3472,6 +3503,43 @@ def _run_sequential_read(fildata):
     return pnds.sequential_read_records()
 
 
+def _build_sector_mask(rec):
+    """
+    Range/Angle datagram is going to have duplicate times, which are no good for our Xarray dataset.  Duplicates are
+    found at the same time but with different sectors, serial numbers (dualheadsystem) and/or frequency.  Split up the
+    records by these three elements and use them as the sector identifier
+
+    Parameters
+    ----------
+    rec: dict as returned by sequential_read_records
+
+    Returns
+    -------
+    sector_ids = list, contains string identifiers for each sector, ex:
+            ['40111_0_265000', '40111_0_275000', '40111_1_285000', '40111_1_290000', '40111_2_270000', '40111_2_280000']
+    id_mask = list, index of where each sector_id identifier shows up in the data
+
+    """
+    # serial_nums = [rec['73'][x][0] for x in ['serial#', 'serial#2'] if rec['73'][x][0] != 0]
+    serial_nums = list(np.unique(rec['78']['serial#']))
+    sector_nums = [i for i in range(rec['78']['ntx'][0] + 1)]
+    freqs = [f for f in np.unique(rec['78']['frequency'])]
+    sector_ids = []
+    id_mask = []
+
+    for x in serial_nums:
+        ser_mask = np.where(rec['78']['serial#'] == float(x))[0]
+        for y in sector_nums:
+            sec_mask = np.where(rec['78']['transmitsector#'] == float(y))[0]
+            for z in freqs:
+                f_mask = np.where(rec['78']['frequency'] == z)[0]
+                totmask = [x for x in ser_mask if (x in sec_mask) and (x in f_mask)]
+                if len(totmask) > 0:
+                    sector_ids.append(str(x) + '_' + str(y) + '_' + str(int(z)))
+                    id_mask.append(totmask)
+    return sector_ids, id_mask
+
+
 def _sequential_to_xarray(rec):
     """
     After running sequential read, this method will take in the dict of datagrams and return an xarray.
@@ -3486,43 +3554,62 @@ def _sequential_to_xarray(rec):
            altitude
     """
     if '78' not in rec:
-        print('No ping record found for chunk file')
+        print('No ping raw range/angle record found for chunk file')
         return
 
     recs_to_merge = {}
-    tims = np.unique(rec['78']['time'])
+    alltims = np.unique(rec['78']['time'])  # after mask/splitting data, should get something for each unique time
 
     for r in rec:
-        if r not in ['73', '85']:
-            # each Kongsberg datagram is a Xarray Dataset, each record in the datagram is a Xarray DataArray
+        if r not in ['73', '85']:   # These are going to be added as attributes later
             recs_to_merge[r] = xr.Dataset()
-            for ky in rec[r]:
-                if ky != 'time':
-                    if r == '78':
-                        # For some reason I haven't figured out yet, you end up with a duplicate ping at the end,
-                        #   intermittently when running this with chunked files...found it out because the number of
-                        #   unique times didn't line up with record length.  See the np.all checks below
-                        combined_sectors = np.array(np.split(rec['78'][ky], len(rec['78'][ky]) / 3))
+            if r == '78':  # R&A is the only datagram we use that requires splitting by sector/serial#/freq
+                ids, msk = _build_sector_mask(rec)  # get the identifiers and mask for each sector/serial#/freq
+                for ky in rec[r]:
+                    if ky not in ['time', 'serial#', 'frequency', 'transmitsector#']:
+                        combined_sectors = []
+                        for secid in ids:
+                            idx = ids.index(secid)
+                            arr = np.array(rec['78'][ky][msk[idx]])  # that part of the record for the given sect_id
+                            tim = rec['78']['time'][msk[idx]]
+
+                            # currently i'm getting a one rec duplicate between chunked files...
+                            if tim[-1] == tim[-2] and np.array_equal(arr[-1], arr[-2]):
+                                #print('Found duplicate timestamp: {}, {}, {}'.format(r, ky, tim[-1]))
+                                arr = arr[:-1]
+                                tim = tim[:-1]
+
+                            try:
+                                arr = np.squeeze(np.array(arr), axis=1)  # Tx_data is handled this way to get 1D
+                            except ValueError:
+                                pass
+
+                            # use the mask to build a zero-padded array with zeros for all times that have no data
+                            paddedshp = list(arr.shape)
+                            paddedshp[0] = alltims.shape[0]
+                            padded_sector = np.zeros(paddedshp)
+                            padded_sector[np.where(np.isin(alltims, tim))] = arr
+                            combined_sectors.append(padded_sector)
+
+                        combined_sectors = np.array(combined_sectors)
 
                         # these records are by time/sector/beam.  Have to combine recs to build correct array shape
                         if ky in ['beampointingangle', 'transmitsectorid', 'detectioninfo', 'qualityfactor',
                                   'traveltime']:
-                            if np.all(combined_sectors[-2] == combined_sectors[-1]) and combined_sectors.shape[0] != len(tims):
-                                combined_sectors = combined_sectors[0:combined_sectors.shape[0] - 1, :, :]
                             beam_idx = [i for i in range(combined_sectors.shape[2])]
-                            sectors = [i for i in range(combined_sectors.shape[1])]
                             recs_to_merge[r][ky] = xr.DataArray(combined_sectors,
-                                                                coords=[tims, sectors, beam_idx],
-                                                                dims=['time', 'sectors', 'beam'])
+                                                                coords=[ids, alltims, beam_idx],
+                                                                dims=['sectors', 'time', 'beam'])
                         #  everything else isn't by beam, proceed normally
                         else:
-                            if np.all(combined_sectors[-2] == combined_sectors[-1]) and combined_sectors.shape[0] != len(tims):
-                                combined_sectors = combined_sectors[0:combined_sectors.shape[0] - 1, :]
-                            sectors = [i for i in range(combined_sectors.shape[1])]
+                            if combined_sectors.ndim == 3:
+                                combined_sectors = np.squeeze(combined_sectors, axis=2)
                             recs_to_merge[r][ky] = xr.DataArray(combined_sectors,
-                                                                coords=[tims, sectors],
-                                                                dims=['time', 'sectors'])
-                    else:
+                                                                coords=[ids, alltims],
+                                                                dims=['sectors', 'time'])
+            else:
+                for ky in rec[r]:
+                    if ky not in ['time']:
                         recs_to_merge[r][ky] = xr.DataArray(rec[r][ky], coords=[rec[r]['time']], dims=['time'])
 
     # take range/angle rec and merge on to that index, gets attitude/positioning aligned with the ping
@@ -3536,19 +3623,26 @@ def _sequential_to_xarray(rec):
     # Merge the dataset with inner join: intersection of time index
     final = xr.merge([recs_to_merge[r] for r in recs_to_merge if r not in ['73']], join='inner')
 
-    # add on attribute for installation parameters, basically the same way as you do for the ss profile, except it
-    #   has no coordinate to index by.  Also, use json.dumps to avoid the issues with serializing lists/dicts with
-    #   to_netcdf
-    if '73' in rec:
-        for t in rec['73']['time']:
-            idx = np.where(rec['73']['time'] == t)
-            final.attrs['settings_{}'.format(int(t))] = json.dumps(rec['73']['settings'][idx][0])
-
+    # Stuff that isn't of the same dimensions as the dataset are tacked on as attributes
     if '85' in rec:
         for t in rec['85']['time']:
             idx = np.where(rec['85']['time'] == t)
             profile = np.dstack([rec['85']['depth'][idx][0], rec['85']['soundspeed'][idx][0]])[0]
             final.attrs['profile_{}'.format(int(t))] = json.dumps(profile.tolist())
+
+    # add on attribute for installation parameters, basically the same way as you do for the ss profile, except it
+    #   has no coordinate to index by.  Also, use json.dumps to avoid the issues with serializing lists/dicts with
+    #   to_netcdf
+
+    # I'm including these serial numbers for the dual/dual setup.  System is port, Secondary_system is starboard.  These
+    #   are needed to identify pings and which offsets to use (TXPORT=Transducer0, TXSTARBOARD=Transducer1,
+    #   RXPORT=Transducer2, RXSTARBOARD=Transudcer3)
+    if '73' in rec:
+        final.attrs['system_serial_number'] = np.unique(rec['73']['serial#'])
+        final.attrs['secondary_system_serial_number'] = np.unique(rec['73']['serial#2'])
+        for t in rec['73']['time']:
+            idx = np.where(rec['73']['time'] == t)
+            final.attrs['settings_{}'.format(int(t))] = json.dumps(rec['73']['settings'][idx][0])
 
     return final
 
@@ -3671,9 +3765,9 @@ class BatchRead:
                                            'em2040_dual_rx': [None, 'tx', 'rx_port', 'rx_stbd'],
                                            'em2040_dual_tx': ['tx_port', 'tx_stbd', 'rx_port', 'rx_stbd'],
                          # 'em2040c': [None, 'sonar_head1', 'sonar_head2', None],  not sure how to identify this yet
-                                           'em3002': [None, 'sonar_head1', 'sonar_head2', None],
-                                           'em2040p': [None, 'sonar_head1', None, None],
-                                           'me70bo': ['transducer', None, None, None]}
+                                           'em3002': [None, 'tx', 'rx', None],
+                                           'em2040p': [None, 'txrx', None, None],
+                                           'me70bo': ['txrx', None, None, None]}
 
     def _closest_key_value(self, sortdict, key):
         """
@@ -3722,6 +3816,7 @@ class BatchRead:
         if self.rawdat is not None:
             self.readsuccess = True
             self.build_offsets()
+            self.translate_runtime()
             if remove_localrawdat:
                 # If you read in new data, you probably want to remove the local dataframe copies if they exist just to
                 #   avoid confusion
@@ -3847,6 +3942,13 @@ class BatchRead:
                 print('ERROR: Sonar model not understood "{}"'.format(snrmodels[0]))
                 return
 
+            mintime = float(min(list(settdict.keys())))
+            minactual = float(self.rawdat.time.min().compute())
+            if mintime > minactual:
+                print('Installation Parameters minimum time: {}'.format(mintime))
+                print('Actual data minimum time: {}'.format(minactual))
+                raise ValueError('Installation Parameters does not cover the whole dataset.')
+
             # translate over the offsets/angles for the transducers following the sonar_translator scheme
             self.sonartype = snrmodels[0]
             for tme in settdict:
@@ -3887,6 +3989,48 @@ class BatchRead:
                         newdict[stmp][ky] = self.xyzrph[ky][stmp]
                 self.xyzrph = SortedDict(newdict)
                 print('Constructed offsets successfully')
+
+    def translate_runtime(self):
+        """
+        Apply lookup tables from Kongsberg runtime parameters doc to translate to pitch/yaw stab signifiers
+
+        'Y' for Yaw stab, 'P' for pitch stab, 'PY' for both
+
+        """
+        bit_chks = [None, None, None, None, None, _xarr_is_bit_set(self.rawdat['mode'], 5),
+                    _xarr_is_bit_set(self.rawdat['mode'], 6), None, None]
+
+        if self.sonartype in ['em2040', 'em122', 'em710' 'em2040_dual_rx', 'em2040_dual_tx']:
+            # xx01xxxx for mixed, xx00xxxx for CW, xx10xxxx for FM
+            self.rawdat['mode'] = self.rawdat['mode'].where((bit_chks[6] == 0) & (bit_chks[5] > 0)).fillna('MIXED')
+            self.rawdat['mode'] = self.rawdat['mode'].where((bit_chks[6] == 0) & (bit_chks[5] == 0)).fillna('CW')
+            self.rawdat['mode'] = self.rawdat['mode'].where((bit_chks[6] > 0) & (bit_chks[5] == 0)).fillna('FM')
+            self.rawdat['mode'] = self.rawdat['mode'].astype(str)
+        elif self.sonartype in ['em2040c', 'em2040p']:
+            # xx0xxxxx for CW, xx1xxxxx for FM
+            self.rawdat['mode'] = self.rawdat['mode'].where(bit_chks[6] == 0).fillna('CW')
+            self.rawdat['mode'] = self.rawdat['mode'].where(bit_chks[6] > 0).fillna('FM')
+            self.rawdat['mode'] = self.rawdat['mode'].astype(str)
+
+        # Pitch/Yaw stabilization appears to be the same across all sonartypes
+        bit_chks = [None, _xarr_is_bit_set(self.rawdat['yawandpitchstabilization'], 1),
+                    _xarr_is_bit_set(self.rawdat['yawandpitchstabilization'], 2),
+                    None, None, None, None, None,
+                    _xarr_is_bit_set(self.rawdat['yawandpitchstabilization'], 8)]
+
+        # xxxxxx00 no yaw stab, xxxxxx10 yaw stab mean vessel heading
+        yaw = self.rawdat['yawandpitchstabilization'].where((bit_chks[1] == 0) & (bit_chks[2] == 0)).fillna('')
+        yaw = yaw.where((bit_chks[1] > 0) & (bit_chks[2] == 0)).fillna('Y')
+
+        # 1xxxxxxx pitch stab, 0xxxxxxx no pitch stab
+        pitch = self.rawdat['yawandpitchstabilization'].where((bit_chks[8] == 0)).fillna('')
+        pitch = pitch.where((bit_chks[8] > 0)).fillna('P')
+
+        # combine these string representations into a datarray, works since the shape is the same
+        self.rawdat['yawandpitchstabilization'] = xr.DataArray((pitch.values + yaw.values).astype(str),
+                                                               coords={'time': self.rawdat['yawandpitchstabilization']['time']},
+                                                               dims=['time'])
+        print('Translated realtime parameters record successfully')
 
     def return_tx_rph(self, time_idx):
         """
@@ -4041,7 +4185,7 @@ def determine_good_chunksize(fil, minchunksize=40000000, max_chunks=20):
         # take remainder of min_chunks and glob it on to the chunksize
         #   if rounding ends up building chunks that leave out the last byte or something, don't worry, you are
         #   retaining the file handler and searching past the chunksize anyway
-        max_chunks = np.floor(min_chunks)
+        max_chunks = int(np.floor(min_chunks))
         finalchunksize = int(minchunksize + (((min_chunks % 1) * minchunksize) / max_chunks))
     else:
         # Need a higher chunksize to get less than max_chunks chunks
