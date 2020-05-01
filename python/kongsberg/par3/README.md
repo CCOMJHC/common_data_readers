@@ -1,3 +1,27 @@
+# kluster (Python 3.6 (and later probably)) - NOAA (Eric Younkin)
+Pure Python distributed processing built on Xarray/Dask for Kongsberg MBES .all files.  Builds georeferenced soundings from range_angle/att/nav in .all files.
+
+ONLY supports .all files that contain range angle datagram (EM710+, EM2040+, etc.)
+
+NOTE: there are still known issues I've yet to resolve for EM2040 dual head.  It will process, but there are artifacts I've yet to track down.
+
+Basic workflow looks like this:
+
+mbes_read = xarray_conversion.BatchRead(r"C:\collab\dasktest\data_dir\EM2040c\0650_20180711_151518.all")
+fq = fqpr_generation.Fqpr(mbes_read)
+fq.read_from_source()
+fq.get_orientation_vectors()
+fq.build_beam_pointing_vector()
+fq.sv_correct()
+
+Some convenience functions include:
+
+fqpr_generation.generate_new_xyz
+- Exports sv corrected georeferenced soundings to xyz
+
+test_fqpr_generation.validation_against_xyz88
+- Builds plots and compares Kluster sv corrected soundings with .all XYZ88 datagram
+
 # par3 module - NOAA
 par3 module (originally developed by Glen) used by NOAA for reading .all files
 
@@ -188,105 +212,3 @@ Can be used in one of three major ways:
           0.        ,   0.        ],
         [-40.96999741, -41.45999908, -41.79000092, ...,   0.        ,
           0.        ,   0.        ]])
-          
-## 3. BatchRead class and Xarray
- 
- Requires Xarray / Dask to function!  Reads all .all files in a given folder, returns xarray Dataset
- 
- > import par3 as par
- 
- > b_read = par.BatchRead(r'C:\collab\dasktest')
- 
- > b_read.read()
- 
- > Out:
- 
- > Running Kongsberg .all converter...
-
- > C:\collab\dasktest\0009_20170523_181119_FA2806.all: Using 4 chunks of size 1962957
-
- > Distributed conversion complete: 2.5396290000000006s
- 
- > distributed.nanny - WARNING - Worker process still alive after 4 seconds, killing
- 
- > distributed.nanny - WARNING - Worker process still alive after 4 seconds, killing
-
- > distributed.nanny - WARNING - Worker process still alive after 4 seconds, killing
-
- > distributed.nanny - WARNING - Worker process still alive after 4 seconds, killing
-
- > Found 1 total Installation Parameters entr(y)s
- 
- > Constructed offsets successfully
- 
- > b_read.rawdat
- 
-> Out: 
-
-> <xarray.Dataset>
-
-> Dimensions:             (beam: 182, sectors: 3, time: 216)
-
-> Coordinates:
-
->   * beam                (beam) int64 0 1 2 3 4 5 6 ... 176 177 178 179 180 181
-
->   * sectors             (sectors) int32 0 1 2
-
->   * time                (time) float64 1.496e+09 1.496e+09 ... 1.496e+09
-
-> Data variables:
-
->     roll                (time) float32 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     pitch               (time) float32 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     heave               (time) float32 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     heading             (time) float32 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     soundspeed          (time, sectors) float32 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     ntx                 (time, sectors) uint16 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     nrx                 (time, sectors) uint16 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     nvalid              (time, sectors) uint16 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     samplerate          (time, sectors) float32 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     transmitsector#     (time, sectors) uint8 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     tiltangle           (time, sectors) float32 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     signallength        (time, sectors) float32 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     delay               (time, sectors) float32 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     frequency           (time, sectors) float32 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     waveformid          (time, sectors) uint8 dask.array<chunksize=(55, 3), meta=np.ndarray>
-
->     beampointingangle   (time, sectors, beam) float64 dask.array<chunksize=(55, 3, 182), meta=np.ndarray>
-
->     transmitsectorid    (time, sectors, beam) float64 dask.array<chunksize=(55, 3, 182), meta=np.ndarray>
-
->     detectioninfo       (time, sectors, beam) float64 dask.array<chunksize=(55, 3, 182), meta=np.ndarray>
-
->     qualityfactor       (time, sectors, beam) float64 dask.array<chunksize=(55, 3, 182), meta=np.ndarray>
-
->     traveltime          (time, sectors, beam) float64 dask.array<chunksize=(55, 3, 182), meta=np.ndarray>
-
->     latitude            (time) float64 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     longitude           (time) float64 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     alongtrackvelocity  (time) float32 dask.array<chunksize=(55,), meta=np.ndarray>
-
->     altitude            (time) float64 dask.array<chunksize=(55,), meta=np.ndarray>
-
-> Attributes:
-
->     settings_1495563079:  {"waterline_vertical_location": "-0.640", "system_m...
-
->     profile_1495599960:   [[0.0, 1489.2000732421875], [0.32, 1489.20007324218...
