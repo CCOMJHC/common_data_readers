@@ -26,6 +26,14 @@ OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 
+Sign conventions
+Pitch - Positive tilt up
+Roll - Positive port side up
+Acrosstrack xyz88 - Starboard Positive
+Alongtrack xyz88 - Forward Positive
+BeamPointingAngle data78 - port positive
+
+
 V1.0 20191213
 This module includes a number of different classes and methods for working with
 Kongsberg all files, each of which are intended to serve at least one of three
@@ -46,31 +54,20 @@ import sys
 import os
 import numpy as np
 from matplotlib import pyplot as plt
-from mpl_toolkits.basemap import pyproj
+import pyproj
 import datetime as dtm
 import pickle
-from glob import glob
 import struct
 import re
 import copy
-import webbrowser
-from time import perf_counter
-from itertools import islice
-from sortedcontainers import SortedDict
-import json
+from glob import glob
 
-try:
-    from dask.distributed import get_client, Client, wait
-    import xarray as xr
-    batch_read_enabled = True
-except ModuleNotFoundError:
-    batch_read_enabled = False
 
 recs_categories = {'65': ['data.Time', 'data.Roll', 'data.Pitch', 'data.Heave', 'data.Heading'],
                    '73': ['time', 'header.Serial#', 'header.Serial#2', 'settings'],
-                   '78': ['time', 'header.SoundSpeed', 'header.Ntx', 'header.Nrx', 'header.Nvalid',
+                   '78': ['time', 'header.Counter', 'header.SoundSpeed', 'header.Ntx', 'header.Nrx',
                           'header.SampleRate', 'header.Serial#', 'tx.TransmitSector#', 'tx.TiltAngle',
-                          'tx.SignalLength', 'tx.Delay', 'tx.Frequency', 'tx.WaveformID', 'rx.BeamPointingAngle',
+                          'tx.Delay', 'tx.Frequency', 'tx.WaveformID', 'rx.BeamPointingAngle',
                           'rx.TransmitSectorID', 'rx.DetectionInfo', 'rx.QualityFactor', 'rx.TravelTime'],
                    '82': ['time', 'header.Mode', 'header.YawAndPitchStabilization'],
                    '85': ['time', 'data.Depth', 'data.SoundSpeed'],
@@ -178,12 +175,19 @@ class AllRead:
         # search for startbyte + one of the datagramtypes
         search_exp = b'\x02[' + b'|'.join([struct.pack('B', x) for x in recids]) + b']'
         # sonartype always follows datagramtype, include it to eliminate possible mismatches
-        ems = [2040, 710, 712]
+        # EM2040c shows as 2045
+        # EM2040p shows as 2040 (great)
+        # EM3002 shows as 3020 (thats good, it aligns with spec)
+        #
+        # only including 204x, 71x, and 312 systems.  These use the Data78 rec, others use Depth datagram, different
+        #   process
+
+        ems = [2040, 2045, 710, 712, 312]
         emsrchs = []
         for em in ems:
             sonartype = struct.pack('H', em)
-            search_exp += sonartype
-            compiled_expr = re.compile(search_exp)
+            em_search_exp = search_exp + sonartype
+            compiled_expr = re.compile(em_search_exp)
             emsrchs.append(compiled_expr)
         return emsrchs
 
@@ -284,18 +288,73 @@ class AllRead:
                 totalrecs.append(split_rec)
             return totalrecs
 
-    def pad_to_dense(self, M):
+    def pad_to_dense(self, arr, padval=999.0, maxlen=500, override_type=None, detectioninfo=False):
         """
         Appends the minimal required amount of zeroes at the end of each
-        array in the jagged array `M`, such that `M` looses its jagedness.
+        array in the jagged array `M`, such that `M` looses its jaggedness.
         """
 
-        maxlen = max(len(r) for r in M)
+        # override the dynamic length of beams across records by applying static length limit.
+        # ideally this should cover all cases
+        if override_type is not None:
+            typ = override_type
+        else:
+            typ = arr[0].dtype
 
-        Z = np.zeros((len(M), maxlen))
-        for enu, row in enumerate(M):
-            Z[enu, :len(row)] += row
+        Z = np.full((len(arr), maxlen), padval, dtype=typ)
+        for enu, row in enumerate(arr):
+            if detectioninfo:
+                Z[enu, :len(row)] = self.translate_detectioninfo(row)
+            else:
+                Z[enu, :len(row)] = row
         return Z
+
+    def translate_detectioninfo(self, arr):
+        """
+        Translate the binary code to an int identifier
+        'detectioninfo' = 0 for amplitude detect, 1 for phase detect, 2 for rejected due to invalid detection
+
+        0xxxxxx0 = amplitude detect, 0xxxxxx1 = phase detect, 1xxxxxxx = rejected
+        """
+        rslt = np.zeros(arr.shape, dtype=int)
+        first_bit_chk = np.bitwise_and(arr, (1 << 0)).astype(bool)
+        last_bit_chk = np.bitwise_and(arr, (1 << 7)).astype(bool)
+
+        rslt[np.where(last_bit_chk)] = 2
+        rslt[np.intersect1d(np.where(last_bit_chk == False), np.where(first_bit_chk))] = 1
+        rslt[np.intersect1d(np.where(last_bit_chk == False), np.where(first_bit_chk == False))] = 0
+        return rslt
+
+    def translate_yawpitch(self, arr):
+        """
+        Translate the binary code to a string identifier
+
+        'yawandpitchstabilization' = 'Y' for Yaw stab, 'P' for pitch stab, 'PY' for both, 'N' for neither
+        # xxxxxx00 no yaw stab, xxxxxx10 yaw stab mean vessel heading
+        # 1xxxxxxx pitch stab, 0xxxxxxx no pitch stab
+        """
+        rslt = np.full(arr.shape, 'N', dtype='U2')
+        sec_bit_chk = np.bitwise_and(arr, (1 << 1)).astype(bool)
+        last_bit_chk = np.bitwise_and(arr, (1 << 7)).astype(bool)
+
+        rslt[np.intersect1d(np.where(last_bit_chk), np.where(sec_bit_chk))] = 'PY'
+        rslt[np.intersect1d(np.where(last_bit_chk), np.where(sec_bit_chk == False))] = 'P'
+        rslt[np.intersect1d(np.where(last_bit_chk == False), np.where(sec_bit_chk))] = 'Y'
+        return rslt
+
+    def translate_mode(self, arr):
+        """
+        Translate the binary code to a string identifier
+
+        'mode' = 'CW' for continuous waveform, 'FM' for frequency modulated
+        # xx0xxxxx for CW, xx1xxxxx for FM
+
+        """
+        rslt = np.zeros(arr.shape, dtype='U2')
+        six_bit_chk = np.bitwise_and(arr, (1 << 5)).astype(bool)
+        rslt[np.where(six_bit_chk)] = 'FM'
+        rslt[np.where(six_bit_chk == False)] = 'CW'
+        return rslt
 
     def sequential_read_records(self):
         """
@@ -343,22 +402,42 @@ class AllRead:
                             recs_to_read[datagram_type][subrec.lower()].extend(val)
 
         # these loops are to deal with the lists generated above
+        #    exclude some recs as we needed them during processing but not past this point
+        exclude = [{'78': 'transmitsectorid'}]
+        for dgram in exclude:
+            del recs_to_read[list(dgram.keys())[0]][list(dgram.values())[0]]
+
+        # drop the delay array since we've already used it for adjusting ping time
+        recs_to_read['78'].pop('delay')
+
         for rec in recs_to_read:
             for dgram in recs_to_read[rec]:
                 if recs_count[rec] == 0:
-                    recs_to_read[rec][dgram] = np.zeros(0)  # found no records, empty array
+                    if rec != '82' or dgram == 'time':
+                        recs_to_read[rec][dgram] = np.zeros(0)  # found no records, empty array
+                    else:
+                        recs_to_read[rec][dgram] = np.zeros(0, 'U2')  # found no records, empty array of strings for the mode/stab records
                 elif rec in ['65', '110']:  # these recs have time blocks of data in them, need to be concatenated
                     recs_to_read[rec][dgram] = np.concatenate(recs_to_read[rec][dgram])
                 elif rec == '78':
-                    if dgram in ['beampointingangle', 'transmitsectorid', 'detectioninfo', 'qualityfactor',
-                                 'traveltime']:
-                        # these datagrams can vary in number of beams, have to pad with zeros for 'jaggedness'
+                    if dgram in ['beampointingangle', 'qualityfactor', 'traveltime']:
+                        # these datagrams can vary in number of beams, have to pad with 999 for 'jaggedness'
                         recs_to_read[rec][dgram] = self.pad_to_dense(recs_to_read[rec][dgram])
+                    elif dgram in ['detectioninfo']:
+                        # same for detection info, but it also needs to be converted to something other than int8
+                        recs_to_read[rec][dgram] = self.pad_to_dense(recs_to_read[rec][dgram], override_type=np.int,
+                                                                     detectioninfo=True)
+                    else:
+                        recs_to_read[rec][dgram] = np.array(recs_to_read[rec][dgram])
+                elif rec == '82':
+                    if dgram == 'yawandpitchstabilization':
+                        recs_to_read[rec][dgram] = self.translate_yawpitch(np.array(recs_to_read[rec][dgram]))
+                    elif dgram == 'mode':
+                        recs_to_read[rec][dgram] = self.translate_mode(np.array(recs_to_read[rec][dgram]))
                     else:
                         recs_to_read[rec][dgram] = np.array(recs_to_read[rec][dgram])
                 else:
                     recs_to_read[rec][dgram] = np.array(recs_to_read[rec][dgram])
-
         return recs_to_read
 
     def mapfile(self, verbose=False, show_progress=True):
@@ -1085,7 +1164,7 @@ class Datagram:
         except ValueError:
             pass
 
-    def rawdatablock(self):
+    def raw_rangeangleablock(self):
         return self.datablockheader + self.datablock + self.datablockfooter
 
     def decode(self):
@@ -1123,7 +1202,7 @@ class Datagram:
         elif self.dtype == 85:
             self.subpack = Data85(self.datablock, self.byteswap)
         elif self.dtype == 88:
-            self.subpack = Data88(self.datablock, self.byteswap)
+            self.subpack = Data88(self.datablock, self.time, self.byteswap)
         elif self.dtype == 89:
             self.subpack = Data89(self.datablock, self.time, self.byteswap)
         elif self.dtype == 102:
@@ -1465,7 +1544,7 @@ class Data51(BaseData):
             pass
         elif content_type == 6:
             data_sz = np.frombuffer(datablock[self.hdr_sz: self.hdr_sz + 2], dtype='H')[0]
-            self.rawdata = datablock[self.hdr_sz + 2: self.hdr_sz + 2 + data_sz]
+            self.raw_rangeanglea = datablock[self.hdr_sz + 2: self.hdr_sz + 2 + data_sz]
             if model == 710:
                 self._parse_710_bscorr()
             elif model == 122:
@@ -1475,7 +1554,7 @@ class Data51(BaseData):
         """
         Parse the BSCorr file.
         """
-        c = self.rawdata.split('#')
+        c = self.raw_rangeanglea.split('#')
         t = len(c)
         n = 0
         self.names = []
@@ -1514,7 +1593,7 @@ class Data51(BaseData):
         """
         Parse the BSCorr file.
         """
-        c = self.rawdata.split('\n')
+        c = self.raw_rangeanglea.split('\n')
         t = len(c) - 1  # no need to look at hex flag at end
         n = 0
         header = True
@@ -2128,7 +2207,8 @@ class Data73(BaseData):
                                            'em710': [None, 'tx', 'rx', None], 'em2040': [None, 'tx', 'rx', None],
                                            'em2040_dual_rx': [None, 'tx', 'rx_port', 'rx_stbd'],
                                            'em2040_dual_tx': ['tx_port', 'tx_stbd', 'rx_port', 'rx_stbd'],
-                                           # 'em2040c': [None, 'sonar_head1', 'sonar_head2', None], not sure how to identify this yet
+                                           # em2045 is the model number given for EM2040c
+                                           'em2045': [None, 'sonar_head1', 'sonar_head2', None],
                                            'em3002': [None, 'sonar_head1', 'sonar_head2', None],
                                            'em2040p': [None, 'sonar_head1', None, None],
                                            'me70bo': ['transducer', None, None, None]}
@@ -2690,11 +2770,11 @@ class Data88(BaseData):
                    'SoundSpeed': 0.1,  # convert to m/s
                    }
 
-    def __init__(self, datablock, byteswap=False):
+    def __init__(self, datablock, POSIXtime, byteswap=False):
         """Catches the binary datablock and decodes the first section and calls
         the decoder for the rest of the record."""
         super(Data88, self).__init__(datablock, byteswap=byteswap)
-
+        self.time = POSIXtime
         self.read(datablock[self.hdr_sz:])  # calling this way to maintain backward compatibility
 
     def read(self, datablock):
@@ -3468,652 +3548,6 @@ class mappack:
         self.totalfilesize = os.stat(infilename).st_size
 
 
-def _xarr_is_bit_set(da, bitpos):
-    """
-    Check if bit is set using the Xarray DataArray and bit position.  Returns True if set.
-    Parameters
-    ----------
-    num: integer value for flag to check
-    bitpos: integer offset representing bit posititon (3 to check 3rd bit)
-
-    Returns
-    -------
-    chk: True if bitpos bit is set in val
-
-    """
-    try:
-        # get integer value from bitpos and return True if set in num
-        return da & (1 << (bitpos - 1))
-    except TypeError:
-        return da
-
-
-def _run_sequential_read(fildata):
-    """
-    Function for managing par.sequential_read_records.  Takes in .all files, outputs dict of records
-
-    Returns
-    -------
-    pd.sequential_read_records: dict
-        Dictionary where keys are the datagram type numbers and values are dicts of columns/rows from datagram
-
-    """
-    fil, offset, endpt = fildata
-    pnds = AllRead(fil, start_ptr=offset, end_ptr=endpt)
-    return pnds.sequential_read_records()
-
-
-def _build_sector_mask(rec):
-    """
-    Range/Angle datagram is going to have duplicate times, which are no good for our Xarray dataset.  Duplicates are
-    found at the same time but with different sectors, serial numbers (dualheadsystem) and/or frequency.  Split up the
-    records by these three elements and use them as the sector identifier
-
-    Parameters
-    ----------
-    rec: dict as returned by sequential_read_records
-
-    Returns
-    -------
-    sector_ids = list, contains string identifiers for each sector, ex:
-            ['40111_0_265000', '40111_0_275000', '40111_1_285000', '40111_1_290000', '40111_2_270000', '40111_2_280000']
-    id_mask = list, index of where each sector_id identifier shows up in the data
-
-    """
-    # serial_nums = [rec['73'][x][0] for x in ['serial#', 'serial#2'] if rec['73'][x][0] != 0]
-    serial_nums = list(np.unique(rec['78']['serial#']))
-    sector_nums = [i for i in range(rec['78']['ntx'][0] + 1)]
-    freqs = [f for f in np.unique(rec['78']['frequency'])]
-    sector_ids = []
-    id_mask = []
-
-    for x in serial_nums:
-        ser_mask = np.where(rec['78']['serial#'] == float(x))[0]
-        for y in sector_nums:
-            sec_mask = np.where(rec['78']['transmitsector#'] == float(y))[0]
-            for z in freqs:
-                f_mask = np.where(rec['78']['frequency'] == z)[0]
-                totmask = [x for x in ser_mask if (x in sec_mask) and (x in f_mask)]
-                if len(totmask) > 0:
-                    sector_ids.append(str(x) + '_' + str(y) + '_' + str(int(z)))
-                    id_mask.append(totmask)
-    return sector_ids, id_mask
-
-
-def _sequential_to_xarray(rec):
-    """
-    After running sequential read, this method will take in the dict of datagrams and return an xarray.
-
-    Returns
-    -------
-    final: Xarray.Dataset
-        - coordinates include time, sectors, beam, profile_depth
-        - variables include roll, pitch, heave, heading, soundspeed, ntx, nrx, nvalid, samplerate, transmitsector#,
-           tiltangle, signallength, delay, frequency, waveformid, beampointingangle, transmitsectorid, detectioninfo,
-           qualityfactor, traveltime, speed, course, soundspeedprofile_XXXXX, latitude, longitude, alongtrackvelocity,
-           altitude
-    """
-    if '78' not in rec:
-        print('No ping raw range/angle record found for chunk file')
-        return
-
-    recs_to_merge = {}
-    alltims = np.unique(rec['78']['time'])  # after mask/splitting data, should get something for each unique time
-
-    for r in rec:
-        if r not in ['73', '85']:   # These are going to be added as attributes later
-            recs_to_merge[r] = xr.Dataset()
-            if r == '78':  # R&A is the only datagram we use that requires splitting by sector/serial#/freq
-                ids, msk = _build_sector_mask(rec)  # get the identifiers and mask for each sector/serial#/freq
-                for ky in rec[r]:
-                    if ky not in ['time', 'serial#', 'frequency', 'transmitsector#']:
-                        combined_sectors = []
-                        for secid in ids:
-                            idx = ids.index(secid)
-                            arr = np.array(rec['78'][ky][msk[idx]])  # that part of the record for the given sect_id
-                            tim = rec['78']['time'][msk[idx]]
-
-                            # currently i'm getting a one rec duplicate between chunked files...
-                            if tim[-1] == tim[-2] and np.array_equal(arr[-1], arr[-2]):
-                                #print('Found duplicate timestamp: {}, {}, {}'.format(r, ky, tim[-1]))
-                                arr = arr[:-1]
-                                tim = tim[:-1]
-
-                            try:
-                                arr = np.squeeze(np.array(arr), axis=1)  # Tx_data is handled this way to get 1D
-                            except ValueError:
-                                pass
-
-                            # use the mask to build a zero-padded array with zeros for all times that have no data
-                            paddedshp = list(arr.shape)
-                            paddedshp[0] = alltims.shape[0]
-                            padded_sector = np.zeros(paddedshp)
-                            padded_sector[np.where(np.isin(alltims, tim))] = arr
-                            combined_sectors.append(padded_sector)
-
-                        combined_sectors = np.array(combined_sectors)
-
-                        # these records are by time/sector/beam.  Have to combine recs to build correct array shape
-                        if ky in ['beampointingangle', 'transmitsectorid', 'detectioninfo', 'qualityfactor',
-                                  'traveltime']:
-                            beam_idx = [i for i in range(combined_sectors.shape[2])]
-                            recs_to_merge[r][ky] = xr.DataArray(combined_sectors,
-                                                                coords=[ids, alltims, beam_idx],
-                                                                dims=['sectors', 'time', 'beam'])
-                        #  everything else isn't by beam, proceed normally
-                        else:
-                            if combined_sectors.ndim == 3:
-                                combined_sectors = np.squeeze(combined_sectors, axis=2)
-                            recs_to_merge[r][ky] = xr.DataArray(combined_sectors,
-                                                                coords=[ids, alltims],
-                                                                dims=['sectors', 'time'])
-            else:
-                for ky in rec[r]:
-                    if ky not in ['time']:
-                        recs_to_merge[r][ky] = xr.DataArray(rec[r][ky], coords=[rec[r]['time']], dims=['time'])
-
-    # take range/angle rec and merge on to that index, gets attitude/positioning aligned with the ping
-    for r in recs_to_merge:
-        if r not in ['73', '78', '85']:
-            if r == '110':  # Data110 has duplicate values, should probably check on why this is
-                _, index = np.unique(recs_to_merge[r]['time'], return_index=True)
-                recs_to_merge[r] = recs_to_merge[r].isel(time=index)
-            recs_to_merge[r] = recs_to_merge[r].reindex_like(recs_to_merge['78'], method='nearest')
-
-    # Merge the dataset with inner join: intersection of time index
-    final = xr.merge([recs_to_merge[r] for r in recs_to_merge if r not in ['73']], join='inner')
-
-    # Stuff that isn't of the same dimensions as the dataset are tacked on as attributes
-    if '85' in rec:
-        for t in rec['85']['time']:
-            idx = np.where(rec['85']['time'] == t)
-            profile = np.dstack([rec['85']['depth'][idx][0], rec['85']['soundspeed'][idx][0]])[0]
-            final.attrs['profile_{}'.format(int(t))] = json.dumps(profile.tolist())
-
-    # add on attribute for installation parameters, basically the same way as you do for the ss profile, except it
-    #   has no coordinate to index by.  Also, use json.dumps to avoid the issues with serializing lists/dicts with
-    #   to_netcdf
-
-    # I'm including these serial numbers for the dual/dual setup.  System is port, Secondary_system is starboard.  These
-    #   are needed to identify pings and which offsets to use (TXPORT=Transducer0, TXSTARBOARD=Transducer1,
-    #   RXPORT=Transducer2, RXSTARBOARD=Transudcer3)
-    if '73' in rec:
-        final.attrs['system_serial_number'] = np.unique(rec['73']['serial#'])
-        final.attrs['secondary_system_serial_number'] = np.unique(rec['73']['serial#2'])
-        for t in rec['73']['time']:
-            idx = np.where(rec['73']['time'] == t)
-            final.attrs['settings_{}'.format(int(t))] = json.dumps(rec['73']['settings'][idx][0])
-
-    return final
-
-
-def _xarr_to_netcdf(pth, xarr):
-    """
-    Runs xarray.to_netcdf on given file
-
-    Returns
-    -------
-    None
-
-    """
-    xarr.to_netcdf(path=pth, mode='w')
-
-
-class BatchRead:
-    """
-    BatchRead - Kongsberg .all data converter using dask infrastructure
-    pass in filfolder full of .all files, call read(), and gain access to xarray Dataset object
-
-    BatchRead is stored internally using the following conventions:
-    - X = + Forward, Y = + Starboard, Z = + Down
-    - roll = + Port Up, pitch = + Bow Up, gyro = + Clockwise
-
-    self.rawdat will be dask delayed object, if you need to pull locally, use the self.rawdat.compute() method
-
-    In[3]: import par3 as par
-
-    Backend Qt5Agg is interactive backend. Turning interactive mode on.
-
-    In[4]: cnverted = par.BatchRead(r'C:\Collab\dasktest\data_dir')
-
-    In[5]: cnverted.read()
-
-    Started local cluster client...
-    Running Kongsberg .all converter...
-    C:\Collab\dasktest\data_dir\0001_20170822_144548_S5401_X.all: Using 6 chunks of size 44296946
-    C:\Collab\dasktest\data_dir\0003_20170822_150341_S5401_X.all: Using 8 chunks of size 40800594
-    C:\Collab\dasktest\data_dir\0005_20170822_152146_S5401_X.all: Using 7 chunks of size 41886286
-    C:\Collab\dasktest\data_dir\0007_20170822_153922_S5401_X.all: Using 6 chunks of size 43280232
-    C:\Collab\dasktest\data_dir\0009_20170822_155626_S5401_X.all: Using 7 chunks of size 42632467
-    C:\Collab\dasktest\data_dir\0010_20170822_160627_S5401_X.all: Using 5 chunks of size 41804621
-    C:\Collab\dasktest\data_dir\0011_20170822_161430_S5401_X.all: Using 7 chunks of size 43407640
-    C:\Collab\dasktest\data_dir\0012_20170822_162915_S5401_X.all: Using 5 chunks of size 43478335
-    Distributed conversion complete: 64.8518365s
-
-    In[6]: cnverted.rawdat
-
-    Out[6]:
-    <xarray.Dataset>
-    Dimensions:             (beam: 284, sectors: 3, time: 92186)
-    Coordinates:
-      * beam                (beam) int64 0 1 2 3 4 5 6 ... 278 279 280 281 282 283
-      * sectors             (sectors) int32 0 1 2
-      * time                (time) float64 1.503e+09 1.503e+09 ... 1.503e+09
-    Data variables:
-        roll                (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        pitch               (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        heave               (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        heading             (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        soundspeed          (time, sectors) float32 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        ntx                 (time, sectors) uint16 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        nrx                 (time, sectors) uint16 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        nvalid              (time, sectors) uint16 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        samplerate          (time, sectors) float32 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        transmitsector#     (time, sectors) uint8 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        tiltangle           (time, sectors) float32 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        signallength        (time, sectors) float32 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        delay               (time, sectors) float32 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        frequency           (time, sectors) float32 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        waveformid          (time, sectors) uint8 dask.array<chunksize=(1927, 3), meta=np.ndarray>
-        beampointingangle   (time, sectors, beam) float64 dask.array<chunksize=(1927, 3, 284), meta=np.ndarray>
-        transmitsectorid    (time, sectors, beam) float64 dask.array<chunksize=(1927, 3, 284), meta=np.ndarray>
-        detectioninfo       (time, sectors, beam) float64 dask.array<chunksize=(1927, 3, 284), meta=np.ndarray>
-        qualityfactor       (time, sectors, beam) float64 dask.array<chunksize=(1927, 3, 284), meta=np.ndarray>
-        traveltime          (time, sectors, beam) float64 dask.array<chunksize=(1927, 3, 284), meta=np.ndarray>
-        speed               (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        course              (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        latitude            (time) float64 dask.array<chunksize=(1927,), meta=np.ndarray>
-        longitude           (time) float64 dask.array<chunksize=(1927,), meta=np.ndarray>
-        alongtrackvelocity  (time) float32 dask.array<chunksize=(1927,), meta=np.ndarray>
-        altitude            (time) float64 dask.array<chunksize=(1927,), meta=np.ndarray>
-    Attributes:
-        settings_1503413148:  {"waterline_vertical_location": "-1.010", "system_m...
-        profile_1503411780:   [[0.0, 1517.0999755859375], [0.15, 1517.09997558593...
-
-    """
-    def __new__(cls, filfolder, address=None, minchunksize=40000000, max_chunks=20):
-        if not batch_read_enabled:
-            print('Dask and Xarray are required dependencies to run BatchRead.  Please ensure you have these modules ' +
-                  'first.')
-            return None
-        else:
-            return super(BatchRead, cls).__new__(cls)
-
-    def __init__(self, filfolder, address=None, minchunksize=40000000, max_chunks=20):
-        self.filfolder = filfolder
-        self.convert_minchunksize = minchunksize
-        self.convert_maxchunks = max_chunks
-        self.address = address
-        self.rawdat = None
-        self.localrawdat = None
-        self.readsuccess = False
-        self.client = self.dask_find_or_start_client(address=self.address)
-
-        # misc
-        self.extents = None
-
-        # install parameters
-        self.sonartype = None
-        self.xyzrph = None
-
-        # fqpr recs
-        self.nav_motion = None
-        self.fqprdat = None
-
-        self.ky_data73_sonar_translator = {'em122': [None, 'tx', 'rx', None], 'em302': [None, 'tx', 'rx', None],
-                                           'em710': [None, 'tx', 'rx', None], 'em2040': [None, 'tx', 'rx', None],
-                                           'em2040_dual_rx': [None, 'tx', 'rx_port', 'rx_stbd'],
-                                           'em2040_dual_tx': ['tx_port', 'tx_stbd', 'rx_port', 'rx_stbd'],
-                         # 'em2040c': [None, 'sonar_head1', 'sonar_head2', None],  not sure how to identify this yet
-                                           'em3002': [None, 'tx', 'rx', None],
-                                           'em2040p': [None, 'txrx', None, None],
-                                           'me70bo': ['txrx', None, None, None]}
-
-    def _closest_key_value(self, sortdict, key):
-        """
-        Return closest key in `sorted_dict` to given `key`.
-        """
-        # convert between float/int/string as necessary for given key
-        # - return it in the type given by key, i.e. convert it back to the type the user entered
-
-        try:
-            ktyp = str
-            keys = list(islice(sortdict.irange(minimum=key), 1))
-        except TypeError:
-            if type(key) in [float, int]:
-                key = str(key)
-                ktyp = str
-            else:
-                key = float(key)
-                ktyp = float
-            keys = list(islice(sortdict.irange(minimum=key), 1))
-        # build out list of the closest highest/lowest from the given key value
-        keys.extend(list(islice(sortdict.irange(maximum=key, reverse=True), 1)))
-        floatkeys = [float(k) for k in keys]
-
-        if floatkeys:
-            should_be_key = ktyp(min(floatkeys, key=lambda k: abs(float(key) - k)))
-            if should_be_key not in sortdict and ktyp is str:
-                if should_be_key.rstrip('.0') in sortdict:
-                    should_be_key = should_be_key.rstrip('.0')
-                    return should_be_key
-            elif should_be_key in sortdict:
-                return should_be_key
-            else:
-                print('Unable to determine key from given timestamp: {} with given {}'.format(list(sortdict.keys()),
-                                                                                              key))
-                return None
-        return None
-
-    def read(self, remove_localrawdat=True):
-        """
-        Run the batch_read method on all available lines, can clear out existing local data just in case
-        """
-
-        fils = self.batch_read()
-        self.read_from_netcdf_fils(fils)
-
-        if self.rawdat is not None:
-            self.readsuccess = True
-            self.build_offsets()
-            self.translate_runtime()
-            if remove_localrawdat:
-                # If you read in new data, you probably want to remove the local dataframe copies if they exist just to
-                #   avoid confusion
-                self.localrawdat = None
-
-    def read_from_netcdf_fils(self, file_list):
-        """
-        Read from the generated netCDF files constructed with read()
-        """
-        # I'm having to close the LocalCluster before running open_mfdataset to avoid these worker Errors.  Need to
-        #   understand this a bit more.
-        self.client.close()
-        self.rawdat = xr.open_mfdataset(file_list, combine='nested', concat_dim='time', engine='netcdf4')
-
-    def get_local_data(self):
-        """
-        Compute the xarray to generate numpy arrays from xarray/dask delayed arrays
-        """
-        if self.rawdat is None:
-            print('Generate raw data first with read() method.')
-        else:
-            self.localrawdat = self.rawdat.compute()
-
-    def dask_find_or_start_client(self, address=None, silent=False):
-        """
-        Either start or return Dask client in local/networked cluster mode
-
-        Returns
-        -------
-        client: dask.distributed.client.Client instance
-            Client instance representing Local Cluster/Networked Cluster operations
-
-        """
-        try:
-            if address is None:
-                client = get_client()
-                if not silent:
-                    print('Using existing local cluster client...')
-            else:
-                client = get_client(address=address)
-                if not silent:
-                    print('Using existing client on address {}...'.format(address))
-        except ValueError:
-            if address is None:
-                client = Client()
-                if not silent:
-                    print('Started local cluster client...')
-            else:
-                client = Client(address=address)
-                if not silent:
-                    print('Started client on address {}...'.format(address))
-        return client
-
-    def batch_read(self):
-        """
-        General converter for .all files leveraging xarray and dask.distributed
-        Only parses datagrams as determined by par.recs_categories
-
-        Takes in a wrkdir of .all files, outputs a list of netCDF files written from xarray, ready to be read using
-           xarray.open_mfdataset
-
-        Returns
-        -------
-        f_pths: list of netCDF files
-
-        """
-        print('Running Kongsberg .all converter...')
-        starttime = perf_counter()
-
-        if self.client is None:
-            self.client = self.dask_find_or_start_client()
-
-        if self.client is not None:
-            fils = glob(os.path.join(self.filfolder, '*.all'))
-            webbrowser.open_new('http://localhost:8787/status')
-
-            chnks = []
-            for f in fils:
-                chnks.append(return_chunked_fil(f, 0, determine_good_chunksize(f, self.convert_minchunksize,
-                                                                               self.convert_maxchunks)))
-            chnks_flat = [c for subc in chnks for c in subc]
-            # chnks_flat is now a list of lists representing chunks of each file
-
-            recfutures = self.client.map(_run_sequential_read, chnks_flat)
-            # recfutures is a list of futures representing dicts from sequential read
-
-            xarrfutures = self.client.map(_sequential_to_xarray, recfutures)
-            # xarrfutures is a list of futures representing xarray structures for each file chunk
-
-            if not os.path.exists(os.path.join(self.filfolder, 'converted')):
-                os.makedirs(os.path.join(self.filfolder, 'converted'))
-            f_pths = [os.path.join(self.filfolder, 'converted', 'conversion_all_{}.nc'.format(idx)) for idx in
-                      range(len(xarrfutures))]
-            writefuts = self.client.map(_xarr_to_netcdf, f_pths, xarrfutures)
-            wait(writefuts)
-
-            # client.submit(xr.combine_by_coords, [xarrfutures])
-
-            endtime = perf_counter()
-            print('Distributed conversion complete: {}s\n'.format(endtime - starttime))
-
-            return f_pths
-        return None
-
-    def build_offsets(self):
-        """
-        Form time series pandas dataframe for unique entries in installation parameters across all lines
-        """
-        self.xyzrph = {}
-
-        settdict = {}
-        setts = [x for x in self.rawdat.attrs if x[0:8] == 'settings']
-        for sett in setts:
-            settdict[sett.split('_')[1]] = json.loads(self.rawdat.attrs[sett])
-
-        print('Found {} total Installation Parameters entr(y)s'.format(len(settdict)))
-        if len(settdict) > 0:
-            snrmodels = np.unique([settdict[x]['sonar_model_number'] for x in settdict])
-            if len(snrmodels) > 1:
-                print('ERROR: Found multiple sonars types in data provided')
-                return
-            if snrmodels[0] not in self.ky_data73_sonar_translator:
-                print('ERROR: Sonar model not understood "{}"'.format(snrmodels[0]))
-                return
-
-            mintime = float(min(list(settdict.keys())))
-            minactual = float(self.rawdat.time.min().compute())
-            if mintime > minactual:
-                print('Installation Parameters minimum time: {}'.format(mintime))
-                print('Actual data minimum time: {}'.format(minactual))
-                raise ValueError('Installation Parameters does not cover the whole dataset.')
-
-            # translate over the offsets/angles for the transducers following the sonar_translator scheme
-            self.sonartype = snrmodels[0]
-            for tme in settdict:
-                self.xyzrph[tme] = {}
-                for val in [v for v in self.ky_data73_sonar_translator[snrmodels[0]] if v is not None]:  # tx, rx, etc.
-                    ky = self.ky_data73_sonar_translator[snrmodels[0]].index(val)  # 0, 1, 2, etc
-                    self.xyzrph[tme][val + '_x'] = settdict[tme]['transducer_{}_along_location'.format(ky)]
-                    self.xyzrph[tme][val + '_y'] = settdict[tme]['transducer_{}_athwart_location'.format(ky)]
-                    self.xyzrph[tme][val + '_z'] = settdict[tme]['transducer_{}_vertical_location'.format(ky)]
-                    self.xyzrph[tme][val + '_r'] = settdict[tme]['transducer_{}_roll_angle'.format(ky)]
-                    self.xyzrph[tme][val + '_p'] = settdict[tme]['transducer_{}_pitch_angle'.format(ky)]
-                    self.xyzrph[tme][val + '_h'] = settdict[tme]['transducer_{}_heading_angle'.format(ky)]
-
-                # translate over the positioning sensor stuff using the installation parameters active identifiers
-                pos_ident = settdict[tme]['active_position_system_number']   # 'position_1'
-                for suffix in [['_vertical_location', '_z'], ['_along_location', '_x'],
-                               ['_athwart_location', '_y'], ['_time_delay', '_latency']]:
-                    qry = pos_ident + suffix[0]
-                    self.xyzrph[tme]['POSMV' + suffix[1]] = settdict[tme][qry]
-
-                # do the same over motion sensor (which is still the POSMV), make assumption that its one of the motion
-                #   entries
-                pos_motion_ident = settdict[tme]['active_heading_sensor'].split('_')
-                pos_motion_ident = pos_motion_ident[0] + '_sensor_' + pos_motion_ident[1]  # 'motion_1_com2'
-
-                for suffix in [['_vertical_location', '_motionz'], ['_along_location', '_motionx'],
-                               ['_athwart_location', '_motiony'], ['_time_delay', '_motionlatency'],
-                               ['_roll_angle', '_r'], ['_pitch_angle', '_p'], ['_heading_angle', '_h']]:
-                    qry = pos_motion_ident + suffix[0]
-                    self.xyzrph[tme]['POSMV' + suffix[1]] = settdict[tme][qry]
-
-                # generate dict of ordereddicts for fast searching
-                newdict = {}
-                for ky in self.xyzrph:
-                    for stmp in self.xyzrph[ky].keys():
-                        if stmp not in newdict:
-                            newdict[stmp] = SortedDict()
-                        newdict[stmp][ky] = self.xyzrph[ky][stmp]
-                self.xyzrph = SortedDict(newdict)
-                print('Constructed offsets successfully')
-
-    def translate_runtime(self):
-        """
-        Apply lookup tables from Kongsberg runtime parameters doc to translate to pitch/yaw stab signifiers
-
-        'Y' for Yaw stab, 'P' for pitch stab, 'PY' for both
-
-        """
-        bit_chks = [None, None, None, None, None, _xarr_is_bit_set(self.rawdat['mode'], 5),
-                    _xarr_is_bit_set(self.rawdat['mode'], 6), None, None]
-
-        if self.sonartype in ['em2040', 'em122', 'em710' 'em2040_dual_rx', 'em2040_dual_tx']:
-            # xx01xxxx for mixed, xx00xxxx for CW, xx10xxxx for FM
-            self.rawdat['mode'] = self.rawdat['mode'].where((bit_chks[6] == 0) & (bit_chks[5] > 0)).fillna('MIXED')
-            self.rawdat['mode'] = self.rawdat['mode'].where((bit_chks[6] == 0) & (bit_chks[5] == 0)).fillna('CW')
-            self.rawdat['mode'] = self.rawdat['mode'].where((bit_chks[6] > 0) & (bit_chks[5] == 0)).fillna('FM')
-            self.rawdat['mode'] = self.rawdat['mode'].astype(str)
-        elif self.sonartype in ['em2040c', 'em2040p']:
-            # xx0xxxxx for CW, xx1xxxxx for FM
-            self.rawdat['mode'] = self.rawdat['mode'].where(bit_chks[6] == 0).fillna('CW')
-            self.rawdat['mode'] = self.rawdat['mode'].where(bit_chks[6] > 0).fillna('FM')
-            self.rawdat['mode'] = self.rawdat['mode'].astype(str)
-
-        # Pitch/Yaw stabilization appears to be the same across all sonartypes
-        bit_chks = [None, _xarr_is_bit_set(self.rawdat['yawandpitchstabilization'], 1),
-                    _xarr_is_bit_set(self.rawdat['yawandpitchstabilization'], 2),
-                    None, None, None, None, None,
-                    _xarr_is_bit_set(self.rawdat['yawandpitchstabilization'], 8)]
-
-        # xxxxxx00 no yaw stab, xxxxxx10 yaw stab mean vessel heading
-        yaw = self.rawdat['yawandpitchstabilization'].where((bit_chks[1] == 0) & (bit_chks[2] == 0)).fillna('')
-        yaw = yaw.where((bit_chks[1] > 0) & (bit_chks[2] == 0)).fillna('Y')
-
-        # 1xxxxxxx pitch stab, 0xxxxxxx no pitch stab
-        pitch = self.rawdat['yawandpitchstabilization'].where((bit_chks[8] == 0)).fillna('')
-        pitch = pitch.where((bit_chks[8] > 0)).fillna('P')
-
-        # combine these string representations into a datarray, works since the shape is the same
-        self.rawdat['yawandpitchstabilization'] = xr.DataArray((pitch.values + yaw.values).astype(str),
-                                                               coords={'time': self.rawdat['yawandpitchstabilization']['time']},
-                                                               dims=['time'])
-        print('Translated realtime parameters record successfully')
-
-    def return_tx_rph(self, time_idx):
-        """
-        Using the constructed xyzrph attribute (see build_offsets) and a given timestamp, return the roll/pitch/heading
-        transmitter offset nearest in time to the timestamp
-
-        Parameters
-        ----------
-        time_idx = timestamp (accepts int/str/float)
-
-        Returns
-        -------
-        txr, txp, txh = mounting angle offsets for roll/pitch/heading respectively
-
-        """
-        if self.xyzrph is None:
-            self.build_offsets()
-        if self.sonartype == 'em2040':
-            corr_timestmp = self._closest_key_value(self.xyzrph['tx_r'], time_idx)
-            txr = float(self.xyzrph['tx_r'][corr_timestmp])
-            txp = float(self.xyzrph['tx_p'][corr_timestmp])
-            txh = float(self.xyzrph['tx_h'][corr_timestmp])
-            return {corr_timestmp: {'tx_roll': txr, 'tx_pitch': txp, 'tx_heading': txh}}
-        else:
-            raise NotImplementedError('Only EM2040 supported at this time')
-
-    def return_rx_rph(self, time_idx):
-        """
-        Using the constructed xyzrph attribute (see build_offsets) and a given timestamp, return the roll/pitch/heading
-        receiver offset nearest in time to the timestamp
-
-        Parameters
-        ----------
-        time_idx = timestamp (accepts int/str/float)
-
-        Returns
-        -------
-        rxr, rxp, rxh = mounting angle offsets for roll/pitch/heading respectively
-
-        """
-        if self.xyzrph is None:
-            self.build_offsets()
-        if self.sonartype == 'em2040':
-            corr_timestmp = self._closest_key_value(self.xyzrph['rx_r'], time_idx)
-            rxr = float(self.xyzrph['rx_r'][corr_timestmp])
-            rxp = float(self.xyzrph['rx_p'][corr_timestmp])
-            rxh = float(self.xyzrph['rx_h'][corr_timestmp])
-            return {corr_timestmp: {'rx_roll': rxr, 'rx_pitch': rxp, 'rx_heading': rxh}}
-        else:
-            raise NotImplementedError('Only EM2040 supported at this time')
-
-    def get_minmax_extents(self):
-        """
-        Build dataset geographic extents
-        """
-        maxlat = self.rawdat.latitude.max().compute()
-        maxlon = self.rawdat.longitude.max().compute()
-        minlat = self.rawdat.latitude.min().compute()
-        minlon = self.rawdat.longitude.min().compute()
-        print('Max Lat/Lon: {}/{}'.format(maxlat, maxlon))
-        print('Min Lat/Lon: {}/{}'.format(minlat, minlon))
-        self.extents = [maxlat, maxlon, minlat, minlon]
-
-    def show_description(self):
-        """
-        Display xarray Dataset description
-        """
-        print(self.rawdat.info)
-
-    def generate_plots(self):
-        """
-        Generate some example plots showing the abilities of the xarray plotting engine
-        - plot detection info for beams/sectors/times
-        - plot roll/pitch/heave on 3 row plot
-        """
-        self.rawdat.detectioninfo.plot(x='beam', y='time', col='sectors', col_wrap=3)
-
-        fig, axes = plt.subplots(nrows=3)
-        self.rawdat['roll'].plot(ax=axes[0])
-        self.rawdat['pitch'].plot(ax=axes[1])
-        self.rawdat['heading'].plot(ax=axes[2])
-
-
 def plot_all_nav(directory='.'):
     """
     Plots the parts of the navarray from all files in the directory.
@@ -4161,70 +3595,6 @@ def plot_all_nav(directory='.'):
         plt.draw()
 
 
-def determine_good_chunksize(fil, minchunksize=40000000, max_chunks=20):
-    """
-    With given file, determine the best size of the chunk to read from it, given a minimum chunksize and a max
-    number of chunks.
-
-    Returns
-    -------
-    finalchunksize: int
-        Size in bytes for the recommended chunk size
-
-    """
-    filesize = os.path.getsize(fil)
-
-    # get number of chunks at minchunksize
-    min_chunks = filesize / minchunksize
-    if filesize <= minchunksize:
-        # really small files can be below the given minchunksize in size.  Just use 4 chunks per in this case
-        finalchunksize = int(filesize / 4)
-        max_chunks = 4
-    elif min_chunks <= max_chunks:
-        # small files can use the minchunksize and be under the maxchunks per file
-        # take remainder of min_chunks and glob it on to the chunksize
-        #   if rounding ends up building chunks that leave out the last byte or something, don't worry, you are
-        #   retaining the file handler and searching past the chunksize anyway
-        max_chunks = int(np.floor(min_chunks))
-        finalchunksize = int(minchunksize + (((min_chunks % 1) * minchunksize) / max_chunks))
-    else:
-        # Need a higher chunksize to get less than max_chunks chunks
-        # Take chunks over max_chunks and increase chunksize to get to max_chunks
-        overflowchunks = min_chunks - max_chunks
-        finalchunksize = int(minchunksize + ((overflowchunks * minchunksize) / max_chunks))
-
-    print('{}: Using {} chunks of size {}'.format(fil, max_chunks, finalchunksize))
-    return finalchunksize
-
-
-def return_chunked_fil(fil, startoffset=0, chunksize=20*1024*1024):
-    """
-    With given file, determine the best size of the chunk to read from it, given a minimum chunksize and a max
-    number of chunks.
-
-    Returns
-    -------
-    chunkfil: list of lists
-        List containing [filepath, starting offset in bytes, end of chunk pointer in bytes] for each chunk to be read
-        from file
-
-    """
-    filesize = os.path.getsize(fil)
-    midchunks = [(t * chunksize + chunksize - startoffset) for t in range(int(filesize/chunksize))]
-
-    # Sometimes this results in the last element being basically equal to the filesize when running it under client.map
-    #    Do a quick check and just remove the element so you don't end up with a chunk that is like 10 bytes long
-    if filesize - midchunks[len(midchunks) - 1] <= 1024:
-        midchunks.remove(midchunks[len(midchunks) - 1])
-
-    chunks = [startoffset] + midchunks + [filesize]
-    chnkfil = []
-    for chnk in chunks:
-        if chunks.index(chnk) < len(chunks) - 1:  # list is a range, skip the last one as prev ended at the last index
-            chnkfil.append([fil, chnk, chunks[chunks.index(chnk) + 1]])
-    return chnkfil
-
-
 def _checksum_all_bytes(bytes):
     # Calculate checksum by sum of bytes method
     bytes = bytearray(bytes)
@@ -4232,12 +3602,12 @@ def _checksum_all_bytes(bytes):
     return np.uint16(chk)
 
 
-def checksum_rawdatablock(rawdatablock):
+def checksum_raw_rangeangleablock(raw_rangeangleablock):
     # checksum for bytes between STX and ETX
     # Assuming that the format of the datablock is:
     # 4 bytes datagram size, 1 byte STX -- DATA -- 1 byte ETX, 2 byte checksum
     # I.e. 5 bytes excluded at start and 3 bytes at the end
-    return _checksum_all_bytes(rawdatablock[5:-3])
+    return _checksum_all_bytes(raw_rangeangleablock[5:-3])
 
 
 def main():
